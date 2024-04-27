@@ -53,6 +53,80 @@ def get_bop_video_dirs(dataset):
   return video_dirs
 
 
+class NoematrixReader:
+  def __init__(self, data_dir, downscale=1, shorter_side=None, zfar=np.inf, suffix="jpg"):
+    self.suffix = suffix
+    self.data_dir = data_dir
+    self.downscale = downscale
+    self.zfar = zfar
+    self.color_files = sorted(glob.glob(f"{self.data_dir}/rgb/*.{suffix}"))
+    try:
+      self.K = np.loadtxt(f'{data_dir}/cam_K.txt').reshape(3,3)
+    except:
+      self.K = np.load(f'{data_dir}/camK.npy').reshape(3,3)
+    self.id_strs = []
+    for color_file in self.color_files:
+      id_str = os.path.basename(color_file).replace(f'.{suffix}','')
+      self.id_strs.append(id_str)
+    self.H,self.W = cv2.imread(self.color_files[0]).shape[:2]
+
+    if shorter_side is not None:
+      self.downscale = shorter_side/min(self.H, self.W)
+
+    self.H = int(self.H*self.downscale)
+    self.W = int(self.W*self.downscale)
+    self.K[:2] *= self.downscale
+
+    self.gt_pose_files = sorted(glob.glob(f'{self.data_dir}/annotated_poses/*'))
+
+  def get_camK(self):
+    return self.K
+
+  def get_datset_name(self):
+    return self.data_dir.split('/')[-1]
+
+  def __len__(self):
+    return len(self.color_files)
+
+  def get_gt_pose(self,i):
+    try:
+      pose = np.loadtxt(self.gt_pose_files[i]).reshape(4,4)
+      return pose
+    except:
+      logging.info("GT pose not found, return None")
+      return None
+
+  def get_ori_data(self, i):
+    color = imageio.imread(self.color_files[i])[...,:3]
+    depth = cv2.imread(self.color_files[i].replace('rgb','depth').replace(f"{self.suffix}", "tiff"),-1)
+    camK = np.load(f'{self.data_dir}/camK.npy').reshape(3,3)
+    return color, depth, camK
+
+  def get_color(self,i):
+    color = imageio.imread(self.color_files[i])[...,:3]
+    color = cv2.resize(color, (self.W,self.H), interpolation=cv2.INTER_NEAREST)
+    return color
+
+  def get_mask(self,i):
+    masks = np.load(self.color_files[i].replace('rgb','masks').replace(f'.{self.suffix}','.npy'))
+    res = []
+    for mask in masks:
+      mask = cv2.resize(mask, (self.W,self.H), interpolation=cv2.INTER_NEAREST).astype(bool).astype(np.uint8)
+      res.append(mask)
+    return np.asarray(res)
+
+  def get_depth(self,i):
+    depth = cv2.imread(self.color_files[i].replace('rgb','depth').replace(f"{self.suffix}", "tiff"),-1)/1e3
+    depth = cv2.resize(depth, (self.W,self.H), interpolation=cv2.INTER_NEAREST)
+    depth[(depth<0.1) | (depth>=self.zfar)] = 0
+    return depth
+
+
+  def get_xyz_map(self,i):
+    depth = self.get_depth(i)
+    xyz_map = depth2xyzmap(depth, self.K)
+    return xyz_map
+
 
 class YcbineoatReader:
   def __init__(self,video_dir, downscale=1, shorter_side=None, zfar=np.inf):
@@ -60,7 +134,10 @@ class YcbineoatReader:
     self.downscale = downscale
     self.zfar = zfar
     self.color_files = sorted(glob.glob(f"{self.video_dir}/rgb/*.png"))
-    self.K = np.loadtxt(f'{video_dir}/cam_K.txt').reshape(3,3)
+    try:
+      self.K = np.loadtxt(f'{video_dir}/cam_K.txt').reshape(3,3)
+    except:
+      self.K = np.load(f'{video_dir}/camK.npy').reshape(3,3)
     self.id_strs = []
     for color_file in self.color_files:
       id_str = os.path.basename(color_file).replace('.png','')
@@ -111,6 +188,8 @@ class YcbineoatReader:
 
   def get_mask(self,i):
     mask = cv2.imread(self.color_files[i].replace('rgb','masks'),-1)
+    mask = mask == 10
+    mask = mask.astype(int)
     if len(mask.shape)==3:
       for c in range(3):
         if mask[...,c].sum()>0:
@@ -482,7 +561,7 @@ class YcbVideoReader(BopBaseReader):
     if 'BOP' in self.base_dir:
       mesh_file = os.path.abspath(f'{self.base_dir}/../../ycbv_models/models/obj_{ob_id:06d}.ply')
     else:
-      mesh_file = f'{self.base_dir}/../../ycbv_models/models/obj_{ob_id:06d}.ply'
+      mesh_file = f'{self.base_dir}/../../models/obj_{ob_id:06d}.ply'
     return mesh_file
 
 

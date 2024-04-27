@@ -13,6 +13,7 @@ from datareader import *
 from estimater import *
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/mycpp/build')
+from tqdm import tqdm
 import yaml
 
 
@@ -62,7 +63,12 @@ def run_pose_estimation_worker(reader, i_frames, est:FoundationPose, debug=False
     if ob_id not in scene_ob_ids:
       logging.info(f'skip {ob_id} as it does not exist in this scene')
       continue
-    ob_mask = get_mask(reader, i_frame, ob_id, detect_type=detect_type)
+    mask_key = f"{video_id:06d}_{i_frame+1:06d}_{ob_id}"
+    if mask_key not in mask_dict:
+      logging.info(f'skip {ob_id} as mask does not exist')
+      continue
+    ob_mask = mask_dict[mask_key]
+    # ob_mask = get_mask(reader, i_frame, ob_id, detect_type=detect_type)
 
     est.gt_pose = reader.get_gt_pose(i_frame, ob_id)
     pose = est.register(K=reader.K, rgb=color, depth=depth, ob_mask=ob_mask, ob_id=ob_id, iteration=5)
@@ -79,7 +85,73 @@ def run_pose_estimation_worker(reader, i_frames, est:FoundationPose, debug=False
   return result
 
 
-def run_pose_estimation():
+def run_pose_estimation(mask_dir_name = "ycbv_benchmark"):
+  wp.force_load(device='cuda')
+  video_dirs = sorted(glob.glob(f'{opt.ycbv_dir}/test/*'))
+  mask_dir = f"{opt.ycbv_dir}/{mask_dir_name}"
+  video_ids = np.load(f"{mask_dir}/scene_ids.npy")
+  frame_ids = np.load(f"{mask_dir}/view_ids.npy")
+  obj_ids = np.load(f"{mask_dir}/obj_ids.npy")
+  masks = np.load(f"{mask_dir}/masks.npy")
+
+  res = NestDict()
+
+  debug = opt.debug
+  use_reconstructed_mesh = opt.use_reconstructed_mesh
+  debug_dir = opt.debug_dir
+
+  reader_tmp = YcbVideoReader(video_dirs[0])
+  glctx = dr.RasterizeCudaContext()
+  mesh_tmp = trimesh.primitives.Box(extents=np.ones((3)),transform=np.eye(4))
+  # mesh_tmp = trimesh.primitives.Box(extents=np.ones((3)), transform=np.eye(4))
+  est = FoundationPose(model_pts=mesh_tmp.vertices.copy(), model_normals=mesh_tmp.vertex_normals.copy(), symmetry_tfs=None, mesh=mesh_tmp, scorer=None, refiner=None, glctx=glctx, debug_dir=debug_dir, debug=debug)
+  global mask_dict
+  mask_dict = {}
+  for scene_id, frame, ob_id, mask in zip(video_ids, frame_ids, obj_ids, masks):
+    mask_key = f"{scene_id:06d}_{frame:06d}_{ob_id}"
+    mask_dict[mask_key] = mask
+
+  ob_ids = reader_tmp.ob_ids 
+  for ob_id in ob_ids:
+    if use_reconstructed_mesh:
+      mesh = reader_tmp.get_reconstructed_mesh(ob_id, ref_view_dir=opt.ref_view_dir)
+    else:
+      mesh = reader_tmp.get_gt_mesh(ob_id)
+    symmetry_tfs = reader_tmp.symmetry_tfs[ob_id]
+
+    args = []
+    for video_dir in video_dirs:
+      reader = YcbVideoReader(video_dir, zfar=1.5)
+      scene_ob_ids = reader.get_instance_ids_in_image(0)
+      if ob_id not in scene_ob_ids:
+        continue
+      video_id = reader.get_video_id()
+
+      for i in range(len(reader.color_files)):
+        if not reader.is_keyframe(i):
+          continue
+        args.append((reader, [i], est, debug, ob_id, 0))
+
+
+    est.reset_object(model_pts=mesh.vertices.copy(), model_normals=mesh.vertex_normals.copy(), symmetry_tfs=symmetry_tfs, mesh=mesh)
+    outs = []
+    for index in tqdm(range(len(args))):
+      arg = args[index]
+      out = run_pose_estimation_worker(*arg)
+      outs.append(out)
+      logging.info(f"="*20)
+      logging.info(f"current ob_id:{ob_id}, schedule: {index}/{len(args)}")
+      logging.info(f"="*20)
+    for out in outs:
+      for video_id in out:
+        for id_str in out[video_id]:
+          res[video_id][id_str][ob_id] = out[video_id][id_str][ob_id]
+    
+  with open(f'{opt.debug_dir}/{mask_dir_name}_res.yml','w') as ff:
+    yaml.safe_dump(make_yaml_dumpable(res), ff)
+
+
+def run_pose_estimation_original():
   wp.force_load(device='cuda')
   video_dirs = sorted(glob.glob(f'{opt.ycbv_dir}/test/*'))
   res = NestDict()
@@ -90,7 +162,8 @@ def run_pose_estimation():
 
   reader_tmp = YcbVideoReader(video_dirs[0])
   glctx = dr.RasterizeCudaContext()
-  mesh_tmp = trimesh.primitives.Box(extents=np.ones((3)), transform=np.eye(4))
+  mesh_tmp = trimesh.primitives.Box(extents=np.ones((3)),transform=np.eye(4))
+  # mesh_tmp = trimesh.primitives.Box(extents=np.ones((3)), transform=np.eye(4))
   est = FoundationPose(model_pts=mesh_tmp.vertices.copy(), model_normals=mesh_tmp.vertex_normals.copy(), symmetry_tfs=None, mesh=mesh_tmp, scorer=None, refiner=None, glctx=glctx, debug_dir=debug_dir, debug=debug)
 
   ob_ids = reader_tmp.ob_ids
@@ -134,11 +207,11 @@ def run_pose_estimation():
 if __name__=='__main__':
   parser = argparse.ArgumentParser()
   code_dir = os.path.dirname(os.path.realpath(__file__))
-  parser.add_argument('--ycbv_dir', type=str, default="/mnt/9a72c439-d0a7-45e8-8d20-d7a235d02763/DATASET/YCB_Video", help="data dir")
+  parser.add_argument('--ycbv_dir', type=str, default="/home/yang/ExampleData/ycbv_test_all", help="data dir")
   parser.add_argument('--use_reconstructed_mesh', type=int, default=0)
   parser.add_argument('--ref_view_dir', type=str, default="/mnt/9a72c439-d0a7-45e8-8d20-d7a235d02763/DATASET/YCB_Video/bowen_addon/ref_views_16")
-  parser.add_argument('--debug', type=int, default=0)
-  parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug')
+  parser.add_argument('--debug', type=int, default=1)
+  parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug_ycbv')
   opt = parser.parse_args()
   os.environ["YCB_VIDEO_DIR"] = opt.ycbv_dir
 
@@ -146,4 +219,5 @@ if __name__=='__main__':
 
   detect_type = 'mask'   # mask / box / detected
 
-  run_pose_estimation()
+  run_pose_estimation(mask_dir_name="ycbv_benchmark")
+  run_pose_estimation(mask_dir_name="ycbv_sam_clip")

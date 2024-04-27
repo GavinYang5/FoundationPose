@@ -99,6 +99,66 @@ def set_logging_format(level=logging.INFO):
 set_logging_format()
 
 
+def create_pcd_from_rgbd(
+    rgb,
+    depth,
+    intrinsic,
+    extrinsic=None,
+    depth_scale: float = 1000.0,
+    depth_trunc: float = 1000.0,
+    convert_rgb_to_intensity: bool = True,
+    project_valid_depth_only: bool = True,
+    to_array: bool = False,
+) -> o3d.geometry.PointCloud:
+    """Create point cloud from RGBD image.
+
+    Args:
+        rgb (ndarray): rgb image array.
+        depth (ndarray): depth image array.
+        intrinsic (ndarray): camera intrinsic as 3x3 array.
+        extrinsic (ndarray): extrinsic matrix as 4x4 array.
+        depth_scale (float): the depth is scaled by 1 / depth_scale.
+        depth_trunc (float): truncated at depth_trunc distance, unit in mm.
+        convert_rgb_to_intensity (bool): whether to convert RGB image to intensity image.
+        project_valid_depth_only (bool): whether to project valid depth pixels only.
+        to_array (bool): whether to return point cloud as numpy array.
+    Returns:
+        pcd (o3d.geometry.PointCloud): created point cloud.
+    """
+    rgb_image = o3d.geometry.Image(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
+    depth = depth.astype(np.float32)
+    depth_image = o3d.geometry.Image(depth)
+    height, width = np.asarray(rgb_image).shape[:2]
+
+    intrinsic = o3d.camera.PinholeCameraIntrinsic(
+        width=width,
+        height=height,
+        fx=intrinsic[0, 0],
+        fy=intrinsic[1, 1],
+        cx=intrinsic[0, 2],
+        cy=intrinsic[1, 2],
+    )
+    depth_trunc = depth_trunc / depth_scale
+    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        rgb_image,
+        depth_image,
+        depth_scale=depth_scale,
+        depth_trunc=depth_trunc,
+        convert_rgb_to_intensity=convert_rgb_to_intensity,
+    )
+
+    if extrinsic is None:
+        extrinsic = np.eye(4)
+    else:
+        assert extrinsic.size == 16, "extrinsic matrix must have size 16"
+        extrinsic = extrinsic.reshape(4, 4)
+
+    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
+        rgbd, intrinsic, extrinsic, project_valid_depth_only
+    )
+    if to_array:
+        pcd = np.asarray(pcd.points)
+    return pcd
 
 
 def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):

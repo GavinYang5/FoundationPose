@@ -13,6 +13,9 @@ sys.path.append(f'{code_dir}/../')
 from datareader import *
 from bundlesdf.tool import *
 import yaml,argparse
+import xml.etree.ElementTree as ET
+from transforms3d.euler import quat2mat
+
 
 
 def run_neural_object_field(cfg, K, rgbs, depths, masks, cam_in_obs, debug=0, save_dir='/home/bowen/debug/foundationpose_bundlesdf'):
@@ -73,6 +76,80 @@ def run_one_ob(base_dir, cfg, use_refined_mask=False):
   mesh = run_neural_object_field(cfg, K, rgbs, depths, masks, cam_in_obs, save_dir=save_dir, debug=0)
   return mesh
 
+def load_ycbv_lm(base_dir, use_refined_mask=False):
+  rgbs = []
+  depths = []
+  masks = []
+  cam_in_obs = []
+  color_files = sorted(glob.glob(f'{base_dir}/rgb/*.png'))
+  K = np.loadtxt(f'{base_dir}/K.txt')
+  for i,color_file in enumerate(color_files):
+    rgb = imageio.imread(color_file)
+    depth = cv2.imread(color_file.replace('rgb','depth_enhanced'), -1)/1e3
+    if use_refined_mask:
+      mask = cv2.imread(color_file.replace('rgb','mask_refined'), -1)
+    else:
+      mask = cv2.imread(color_file.replace('rgb','mask'), -1)
+    cam_in_ob = np.loadtxt(color_file.replace('rgb','cam_in_ob').replace('.png','.txt')).reshape(4,4)
+    rgbs.append(rgb)
+    depths.append(depth)
+    masks.append(mask)
+    cam_in_obs.append(cam_in_ob)
+  return K, rgbs, depths, masks, cam_in_obs
+
+
+def get_graspnet_obj_in_camera(xmlfilename, obj_id):
+    xmlfilename = xmlfilename
+    etree = ET.parse(xmlfilename)
+    top = etree.getroot()
+    # posevector foramat: [objectid,x,y,z,alpha,beta,gamma]
+    # posevectorlist = []
+    for i in range(len(top)):
+        objectid = int(top[i][0].text)
+        if objectid != obj_id:
+            continue
+        translationtext = top[i][3].text.split()
+        translation = []
+        for text in translationtext:
+            translation.append(float(text))
+        quattext = top[i][4].text.split()
+        quat = []
+        for text in quattext:
+            quat.append(float(text))
+        pose = np.eye(4)
+        pose[:3, :3] = quat2mat(quat)
+        pose[:3, 3] = translation
+        # alpha, beta, gamma = quat2euler(quat)
+        # x, y, z = translation
+        # alpha *= 180.0 / np.pi
+        # beta *= 180.0 / np.pi
+        # gamma *= 180.0 / np.pi
+        # posevectorlist.append([objectid, x, y, z, alpha, beta, gamma])
+    return pose
+
+def load_graspnet(base_dir, obj_id):
+  rgbs = []
+  depths = []
+  masks = []
+  cam_in_obs = []
+  color_files = sorted(glob.glob(f'{base_dir}/realsense/rgb/*.png'))
+  K = np.load(f'{base_dir}/realsense/camK.npy')
+  color_files = np.random.choice(color_files, 20)
+  for i,color_file in enumerate(color_files):
+    rgb = imageio.imread(color_file)
+    depth = cv2.imread(color_file.replace('rgb','depth'), -1)/1e3
+    mask = cv2.imread(color_file.replace('rgb','label'), -1)
+    mask = mask == obj_id+1
+    mask = mask.astype(np.uint8)
+    ob_in_cam = get_graspnet_obj_in_camera(color_file.replace('rgb','annotations').replace('.png','.xml'), obj_id)
+    # ob_in_cam = np.loadtxt(color_file.replace('rgb','ob_in_cam').replace('.png','.txt')).reshape(4,4)
+    cam_in_ob = np.linalg.inv(ob_in_cam)
+    rgbs.append(rgb)
+    depths.append(depth)
+    masks.append(mask)
+    cam_in_obs.append(cam_in_ob)
+  return K, rgbs, depths, masks, cam_in_obs
+
 
 def run_ycbv():
   ob_ids = np.arange(1,22)
@@ -82,7 +159,11 @@ def run_ycbv():
 
   for ob_id in ob_ids:
     base_dir = f'{args.ref_view_dir}/ob_{ob_id:07d}'
-    mesh = run_one_ob(base_dir=base_dir, cfg=cfg)
+    K, rgbs, depths, masks, cam_in_obs = load_ycbv_lm(base_dir=base_dir)
+    save_dir = f'{base_dir}/nerf'
+    os.system(f'rm -rf {save_dir} && mkdir -p {save_dir}')
+    mesh = run_neural_object_field(cfg, K, rgbs, depths, masks, cam_in_obs, save_dir=save_dir, debug=0)
+    # mesh = run_one_ob(base_dir=base_dir, cfg=cfg)
     out_file = f'{base_dir}/model/model.obj'
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     mesh.export(out_file)
@@ -95,7 +176,30 @@ def run_linemod():
     cfg = yaml.safe_load(ff)
   for ob_id in ob_ids:
     base_dir = f'{args.ref_view_dir}/ob_{ob_id:07d}'
-    mesh = run_one_ob(base_dir=base_dir, cfg=cfg, use_refined_mask=True)
+    K, rgbs, depths, masks, cam_in_obs = load_ycbv_lm(base_dir=base_dir)
+    save_dir = f'{base_dir}/nerf'
+    os.system(f'rm -rf {save_dir} && mkdir -p {save_dir}')
+    mesh = run_neural_object_field(cfg, K, rgbs, depths, masks, cam_in_obs, save_dir=save_dir, debug=0)
+    # mesh = run_one_ob(base_dir=base_dir, cfg=cfg, use_refined_mask=True)
+    out_file = f'{base_dir}/model/model.obj'
+    os.makedirs(os.path.dirname(out_file), exist_ok=True)
+    mesh.export(out_file)
+    logging.info(f"saved to {out_file}")
+
+
+def run_graspnet():
+  ob_ids = [58, 62]
+  scene_id = 100
+  code_dir = os.path.dirname(os.path.realpath(__file__))
+  with open(f'{code_dir}/config_graspnet.yml','r') as ff:
+    cfg = yaml.safe_load(ff)
+  for ob_id in ob_ids:
+    base_dir = f'{args.ref_view_dir}/scenes/scene_{scene_id:04d}'
+    K, rgbs, depths, masks, cam_in_obs = load_graspnet(base_dir=base_dir, obj_id=ob_id)
+    save_dir = f'{base_dir}/nerf' 
+    os.system(f'rm -rf {save_dir} && mkdir -p {save_dir}')
+    mesh = run_neural_object_field(cfg, K, rgbs, depths, masks, cam_in_obs, save_dir=save_dir, debug=0)
+    # mesh = run_one_ob(base_dir=base_dir, cfg=cfg)
     out_file = f'{base_dir}/model/model.obj'
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     mesh.export(out_file)
@@ -105,11 +209,13 @@ def run_linemod():
 if __name__=="__main__":
   parser = argparse.ArgumentParser()
   code_dir = os.path.dirname(os.path.realpath(__file__))
-  parser.add_argument('--ref_view_dir', type=str, default=f'/mnt/9a72c439-d0a7-45e8-8d20-d7a235d02763/DATASET/YCB_Video/bowen_addon/ref_views_16')
-  parser.add_argument('--dataset', type=str, default=f'ycbv', help='one of [ycbv/linemod]')
+  parser.add_argument('--ref_view_dir', type=str, default=f'/home/yang/CodeFolder/FoundationPose/demo_data/graspnet')
+  parser.add_argument('--dataset', type=str, default=f'graspnet', help='one of [ycbv/linemod/graspnet]')
   args = parser.parse_args()
 
   if args.dataset=='ycbv':
     run_ycbv()
-  else:
+  elif args.dataset=='graspnet':
+    run_graspnet()
+  elif args.dataset=='linemod':
     run_linemod()
